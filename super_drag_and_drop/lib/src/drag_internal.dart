@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
@@ -208,8 +209,13 @@ abstract class _DragDetector extends StatelessWidget {
       final rawConfiguration =
           await dragConfiguration.intoRaw(devicePixelRatio);
       // PCC patch: the gesture can end while the images are encoded. The
-      // dragCompleted listener below is not attached yet, so dispose them here.
+      // dragCompleted listener below is not attached yet, so release the
+      // providers and images here. Providers are only released on
+      // releaseDataProvider after a successful start, so they would leak.
       if (drag._ended) {
+        for (final item in rawConfiguration.items) {
+          item.dataProvider.dispose();
+        }
         rawConfiguration.disposeImages();
         _dragContext!.cancelSession(session);
         return;
@@ -220,16 +226,26 @@ abstract class _DragDetector extends StatelessWidget {
         });
         // PCC patch: startDrag throws when the native side refuses the session
         // (e.g. another drag is still active). Cancelling completes dragCompleted,
-        // which disposes the images through the listener above. Disposing them
-        // here as well would dispose them twice.
+        // which disposes the images through the listener above, so they are not
+        // disposed here. The providers are not released by a failed start, so
+        // they are. The error is reported, not left unhandled.
         try {
           await context.startDrag(
               buildContext: buildContext,
               session: session,
               configuration: rawConfiguration,
               position: position);
-        } catch (_) {
+        } catch (e, st) {
           _dragContext!.cancelSession(session);
+          for (final item in rawConfiguration.items) {
+            item.dataProvider.dispose();
+          }
+          FlutterError.reportError(FlutterErrorDetails(
+            exception: e,
+            stack: st,
+            library: 'super_drag_and_drop',
+            context: ErrorDescription('while starting a native drag'),
+          ));
         }
       } else {
         rawConfiguration.disposeImages();

@@ -171,7 +171,8 @@ impl PlatformDragContext {
         session_id: DragSessionId,
     ) -> NativeExtensionsResult<()> {
         // PCC patch: a second drag while one is active (e.g. Cmd+Tab during a drop whose
-        // data is still loading) would be refused by AppKit, so refuse it up front.
+        // data is still loading) may be refused by AppKit, which returns nil. Refuse it up
+        // front instead.
         if !self.sessions.borrow().is_empty()
             || PlatformDataProvider::is_waiting_for_pasteboard_data()
         {
