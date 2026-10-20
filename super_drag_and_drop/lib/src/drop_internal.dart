@@ -77,9 +77,15 @@ class _DropSession extends DropSession {
       }
     }
 
+    // PCC patch: an item with local data comes from this app. Reading it would
+    // resolve our own lazy values (a whole download for a dragged document) on
+    // the main thread while the macOS drag waits; in-app targets only use
+    // localData.
     final itemsNeedingReaders = _items
         .where((element) =>
-            element._item.readerItem != null && element._reader == null)
+            element._item.readerItem != null &&
+            element._reader == null &&
+            element._item.localData == null)
         .toList(growable: false);
 
     if (itemsNeedingReaders.isEmpty) {
