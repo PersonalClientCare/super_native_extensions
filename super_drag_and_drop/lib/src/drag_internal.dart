@@ -207,15 +207,30 @@ abstract class _DragDetector extends StatelessWidget {
     if (dragConfiguration != null) {
       final rawConfiguration =
           await dragConfiguration.intoRaw(devicePixelRatio);
+      // PCC patch: the gesture can end while the images are encoded. The
+      // dragCompleted listener below is not attached yet, so dispose them here.
+      if (drag._ended) {
+        rawConfiguration.disposeImages();
+        _dragContext!.cancelSession(session);
+        return;
+      }
       if (buildContext.mounted) {
         session.dragCompleted.addListener(() {
           rawConfiguration.disposeImages();
         });
-        await context.startDrag(
-            buildContext: buildContext,
-            session: session,
-            configuration: rawConfiguration,
-            position: position);
+        // PCC patch: startDrag throws when the native side refuses the session
+        // (e.g. another drag is still active). Cancelling completes dragCompleted,
+        // which disposes the images through the listener above. Disposing them
+        // here as well would dispose them twice.
+        try {
+          await context.startDrag(
+              buildContext: buildContext,
+              session: session,
+              configuration: rawConfiguration,
+              position: position);
+        } catch (_) {
+          _dragContext!.cancelSession(session);
+        }
       } else {
         rawConfiguration.disposeImages();
       }

@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::{
+    data_provider::PlatformDataProvider,
     drag_common::DropOperationExt,
     util::{class_builder_from_name, flip_rect, ns_image_from_image_data, EventExt},
 };
@@ -29,17 +30,17 @@ use irondash_engine_context::EngineContext;
 use irondash_message_channel::Value;
 use irondash_run_loop::{platform::PollSession, RunLoop};
 use objc2_app_kit::{
-    NSApplication, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSEvent,
-    NSEventPhase, NSEventType, NSView,
+    NSApplication, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
+    NSDraggingSource, NSEvent, NSEventPhase, NSEventType, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSArray, NSPoint, NSProcessInfo, NSRect};
 
 use objc2::{
     class,
     ffi::NSInteger,
-    msg_send,
+    msg_send, msg_send_id,
     rc::Id,
-    runtime::{Bool, Sel},
+    runtime::{Bool, ProtocolObject, Sel},
     sel, ClassType,
 };
 
@@ -169,6 +170,15 @@ impl PlatformDragContext {
         mut providers: HashMap<DataProviderId, DataProviderEntry>,
         session_id: DragSessionId,
     ) -> NativeExtensionsResult<()> {
+        // PCC patch: a second drag while one is active (e.g. Cmd+Tab during a drop whose
+        // data is still loading) would be refused by AppKit, so refuse it up front.
+        if !self.sessions.borrow().is_empty()
+            || PlatformDataProvider::is_waiting_for_pasteboard_data()
+        {
+            return Err(NativeExtensionsError::OtherError(
+                "a drag session is already active".into(),
+            ));
+        }
         unsafe { self.synthesize_mouse_up_event() };
 
         let mut dragging_items = Vec::<Id<NSDraggingItem>>::new();
@@ -208,13 +218,21 @@ impl PlatformDragContext {
         };
 
         let dragging_items = NSArray::from_vec(dragging_items);
-        let session = unsafe {
-            self.view.beginDraggingSessionWithItems_event_source(
-                &dragging_items,
-                &event,
-                &Id::cast(self.view.clone()),
-            )
+        let source: Id<ProtocolObject<dyn NSDraggingSource>> =
+            unsafe { Id::cast(self.view.clone()) };
+        // PCC patch: AppKit returns nil when it refuses the session. The generated binding
+        // would panic on that, which aborts the app inside a callback that cannot unwind.
+        let session: Option<Id<NSDraggingSession>> = unsafe {
+            msg_send_id![
+                &*self.view,
+                beginDraggingSessionWithItems: &*dragging_items,
+                event: &*event,
+                source: &*source
+            ]
         };
+        let session = session.ok_or_else(|| {
+            NativeExtensionsError::OtherError("macOS refused the drag session".into())
+        })?;
 
         let animates = request
             .configuration
