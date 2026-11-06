@@ -87,6 +87,37 @@ pub struct DropItem {
     pub local_data: Value,
 }
 
+/// Builds the items of a drop event. While this process is dragging
+/// (`local_data` is non-empty) the data object belongs to us, so the reader is
+/// never touched: reading its formats would resolve our own lazy values (a whole
+/// document download) on the platform thread. In-app targets only use local data.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn build_drop_items(
+    local_data: &[Value],
+    read_reader_formats: impl FnOnce() -> NativeExtensionsResult<Vec<Vec<String>>>,
+) -> NativeExtensionsResult<Vec<DropItem>> {
+    if !local_data.is_empty() {
+        return Ok(local_data
+            .iter()
+            .enumerate()
+            .map(|(index, data)| DropItem {
+                item_id: (index as i64).into(),
+                formats: Vec::new(),
+                local_data: data.clone(),
+            })
+            .collect());
+    }
+    Ok(read_reader_formats()?
+        .into_iter()
+        .enumerate()
+        .map(|(index, formats)| DropItem {
+            item_id: (index as i64).into(),
+            formats,
+            local_data: Value::Null,
+        })
+        .collect())
+}
+
 #[derive(IntoValue, Debug)]
 #[irondash(rename_all = "camelCase")]
 pub struct DropEvent {
@@ -334,5 +365,49 @@ impl PlatformDropContextDelegate for DropManager {
             }
         });
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn local_drag_never_reads_reader() {
+        let reads = Cell::new(0);
+        let items = build_drop_items(&[Value::I64(1), Value::I64(2)], || {
+            reads.set(reads.get() + 1);
+            Ok(vec![vec!["a".into()], vec!["b".into()]])
+        })
+        .unwrap();
+        assert_eq!(reads.get(), 0);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item_id, 0.into());
+        assert_eq!(items[1].item_id, 1.into());
+        assert!(items.iter().all(|i| i.formats.is_empty()));
+        assert_eq!(items[0].local_data, Value::I64(1));
+        assert_eq!(items[1].local_data, Value::I64(2));
+    }
+
+    #[test]
+    fn external_drag_reads_reader_formats() {
+        let items = build_drop_items(&[], || {
+            Ok(vec![vec!["a".into(), "b".into()], vec!["c".into()]])
+        })
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].formats, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(items[1].formats, vec!["c".to_string()]);
+        assert!(items.iter().all(|i| i.local_data == Value::Null));
+    }
+
+    #[test]
+    fn external_drag_propagates_reader_errors() {
+        let result = build_drop_items(&[], || {
+            Err(NativeExtensionsError::OtherError("boom".into()))
+        });
+        assert!(result.is_err());
     }
 }

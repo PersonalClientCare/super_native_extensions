@@ -6,7 +6,7 @@ use std::{
 };
 
 use irondash_engine_context::EngineContext;
-use irondash_message_channel::{Late, Value};
+use irondash_message_channel::Late;
 use irondash_run_loop::{platform::PollSession, RunLoop};
 use log::warn;
 use windows::{
@@ -35,7 +35,7 @@ use windows::{
 use crate::{
     api_model::{DropOperation, Point},
     drop_manager::{
-        BaseDropEvent, DropEvent, DropItem, DropSessionId, PlatformDropContextDelegate,
+        build_drop_items, BaseDropEvent, DropEvent, DropSessionId, PlatformDropContextDelegate,
         PlatformDropContextId,
     },
     error::{NativeExtensionsError, NativeExtensionsResult},
@@ -233,20 +233,14 @@ impl PlatformDropContext {
         }
         let scaling = get_dpi_for_window(self.view) as f64 / 96.0;
 
-        let reader_items = session.reader.get_items_sync()?;
-
-        let items: Vec<_> = (0..local_data.len().max(reader_items.len()))
-            .map(|index| {
-                Ok(DropItem {
-                    item_id: (index as i64).into(),
-                    formats: match reader_items.get(index) {
-                        Some(item) => session.reader.get_formats_for_item_sync(*item)?,
-                        None => Vec::new(),
-                    },
-                    local_data: local_data.get(index).cloned().unwrap_or(Value::Null),
-                })
-            })
-            .collect::<NativeExtensionsResult<_>>()?;
+        let items = build_drop_items(&local_data, || {
+            session
+                .reader
+                .get_items_sync()?
+                .into_iter()
+                .map(|item| session.reader.get_formats_for_item_sync(item))
+                .collect()
+        })?;
 
         Ok(DropEvent {
             session_id: session.id,
