@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
@@ -291,18 +293,97 @@ class _ImmediatePointerState extends MultiDragPointerState {
   }
 }
 
-class _ImmediateMultiDragGestureRecognizer
+/// Like Flutter's delayed multi drag pointer state, but with the hit slop of
+/// [_computeHitSlop]: the drag starts once the pointer has been held for
+/// [delay]; moving further than the slop before that rejects the pointer.
+class _DelayedPointerState extends MultiDragPointerState {
+  _DelayedPointerState(
+    super.initialPosition,
+    Duration delay,
+    super.kind,
+    super.gestureSettings,
+  ) {
+    _timer = Timer(delay, _delayPassed);
+  }
+
+  Timer? _timer;
+  GestureMultiDragStartCallback? _starter;
+
+  void _delayPassed() {
+    _timer = null;
+    final starter = _starter;
+    if (starter != null) {
+      _starter = null;
+      starter(initialPosition);
+    } else {
+      resolve(GestureDisposition.accepted);
+    }
+  }
+
+  void _stopTimer() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  @override
+  void accepted(GestureMultiDragStartCallback starter) {
+    if (_timer == null) {
+      starter(initialPosition);
+    } else {
+      _starter = starter;
+    }
+  }
+
+  @override
+  void checkForResolutionAfterMove() {
+    if (_timer == null) {
+      return;
+    }
+    assert(pendingDelta != null);
+    if (pendingDelta!.distance > _computeHitSlop(kind, gestureSettings)) {
+      resolve(GestureDisposition.rejected);
+      _stopTimer();
+    }
+  }
+
+  @override
+  void dispose() {
+    _stopTimer();
+    super.dispose();
+  }
+}
+
+/// Drag recognizer of [DesktopDragDetector]. Pointers start a drag as soon as
+/// they move beyond the hit slop, except mouse pointers while [mouseDragDelay]
+/// is set: those must be held for the delay first, so that other recognizers
+/// (e.g. a pan) win when the mouse moves before it elapses.
+@visibleForTesting
+class DesktopMultiDragGestureRecognizer
     extends ImmediateMultiDragGestureRecognizer {
   int? lastPointer;
 
   final LocationIsDraggable isLocationDraggable;
 
-  _ImmediateMultiDragGestureRecognizer({
+  Duration? mouseDragDelay;
+
+  DesktopMultiDragGestureRecognizer({
     required this.isLocationDraggable,
+    this.mouseDragDelay,
   });
 
   @override
   MultiDragPointerState createNewPointerState(PointerDownEvent event) {
+    final delay = mouseDragDelay;
+    if (event.kind == PointerDeviceKind.mouse &&
+        delay != null &&
+        delay > Duration.zero) {
+      return _DelayedPointerState(
+        event.position,
+        delay,
+        event.kind,
+        gestureSettings,
+      );
+    }
     return _ImmediatePointerState(event.position, event.kind, gestureSettings);
   }
 
@@ -332,21 +413,24 @@ class DesktopDragDetector extends _DragDetector {
     required this.isLocationDraggable,
     required this.hitTestBehavior,
     required super.child,
+    this.mouseDragDelay,
   });
 
   final HitTestBehavior hitTestBehavior;
   final LocationIsDraggable isLocationDraggable;
+  final Duration? mouseDragDelay;
 
   @override
   Widget build(BuildContext context) {
     final devicePixelRatio = MediaQuery.of(context).devicePixelRatio;
     return RawGestureDetector(
       gestures: {
-        _ImmediateMultiDragGestureRecognizer:
-            GestureRecognizerFactoryWithHandlers<
-                    _ImmediateMultiDragGestureRecognizer>(
-                () => _ImmediateMultiDragGestureRecognizer(
-                    isLocationDraggable: isLocationDraggable), (recognizer) {
+        DesktopMultiDragGestureRecognizer: GestureRecognizerFactoryWithHandlers<
+                DesktopMultiDragGestureRecognizer>(
+            () => DesktopMultiDragGestureRecognizer(
+                isLocationDraggable: isLocationDraggable,
+                mouseDragDelay: mouseDragDelay), (recognizer) {
+          recognizer.mouseDragDelay = mouseDragDelay;
           recognizer.onStart = (offset) => maybeStartDrag(
                 context,
                 recognizer.lastPointer,

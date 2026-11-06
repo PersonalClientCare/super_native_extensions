@@ -27,6 +27,7 @@ class BaseDraggableWidget extends StatelessWidget {
     this.hitTestBehavior = HitTestBehavior.deferToChild,
     this.isLocationDraggable = _defaultIsLocationDraggable,
     this.additionalItems = _defaultAdditionalItems,
+    this.mouseDragDelay,
   });
 
   final Widget child;
@@ -45,6 +46,13 @@ class BaseDraggableWidget extends StatelessWidget {
   /// during existing drag sessions. It can be used to provide additional
   /// dragging item for current session.
   final AdditionalItemsProvider additionalItems;
+
+  /// If set (and positive), a drag with the mouse only starts after the button
+  /// has been held for this long without moving beyond the hit slop. Moving
+  /// earlier rejects the drag, so other gesture recognizers (e.g. a pan or a
+  /// selection rectangle) can win. Null (the default) starts the drag as soon
+  /// as the mouse moved beyond the hit slop. Touch is not affected.
+  final Duration? mouseDragDelay;
 
   static Future<List<DragConfigurationItem>?> _defaultAdditionalItems(
       Offset position, DragSession session) async {
@@ -81,6 +89,7 @@ class BaseDraggableWidget extends StatelessWidget {
                 hitTestBehavior: hitTestBehavior,
                 dragConfiguration: dragConfiguration,
                 isLocationDraggable: isLocationDraggable,
+                mouseDragDelay: mouseDragDelay,
                 child: child!,
               ),
             );

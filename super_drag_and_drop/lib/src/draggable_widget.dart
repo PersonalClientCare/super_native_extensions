@@ -196,6 +196,7 @@ class DraggableWidget extends StatelessWidget {
     this.isLocationDraggable = _defaultIsLocationDraggable,
     this.dragItemsProvider = _defaultDragItemsProvider,
     this.additionalDragItemsProvider = _defaultDragItemsProvider,
+    this.mouseDragDelay,
   });
 
   final Widget child;
@@ -214,6 +215,9 @@ class DraggableWidget extends StatelessWidget {
 
   final DragItemsProvider dragItemsProvider;
   final DragItemsProvider additionalDragItemsProvider;
+
+  /// See [BaseDraggableWidget.mouseDragDelay].
+  final Duration? mouseDragDelay;
 
   static bool _defaultIsLocationDraggable(Offset position) => true;
 
@@ -341,6 +345,7 @@ class DraggableWidget extends StatelessWidget {
       child: BaseDraggableWidget(
         isLocationDraggable: isLocationDraggable,
         hitTestBehavior: hitTestBehavior,
+        mouseDragDelay: mouseDragDelay,
         child: child,
         dragConfiguration: (location, session) async {
           final items = dragItemsProvider(context);
