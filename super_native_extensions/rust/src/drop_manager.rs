@@ -91,6 +91,7 @@ pub struct DropItem {
 /// (`local_data` is non-empty) the data object belongs to us, so the reader is
 /// never touched: reading its formats would resolve our own lazy values (a whole
 /// document download) on the platform thread. In-app targets only use local data.
+/// The reader is not handed to Dart either (see `drop_event_reader`).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn build_drop_items(
     local_data: &[Value],
@@ -116,6 +117,14 @@ pub(crate) fn build_drop_items(
             local_data: Value::Null,
         })
         .collect())
+}
+
+/// The reader of a drop event: none while this process is dragging, since
+/// Dart lists its items on every event, which reads our own lazy values
+/// (a whole document download) on the platform thread.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn drop_event_reader<R>(local_data: &[Value], reader: impl FnOnce() -> R) -> Option<R> {
+    local_data.is_empty().then(reader)
 }
 
 #[derive(IntoValue, Debug)]
@@ -409,5 +418,20 @@ mod tests {
             Err(NativeExtensionsError::OtherError("boom".into()))
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn local_drag_sends_no_reader() {
+        let calls = Cell::new(0);
+        let reader = drop_event_reader(&[Value::I64(1)], || {
+            calls.set(calls.get() + 1);
+        });
+        assert!(reader.is_none());
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn external_drag_sends_reader() {
+        assert_eq!(drop_event_reader(&[], || 7), Some(7));
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
     sync::Arc,
@@ -34,8 +34,8 @@ use windows::{
 use crate::{
     api_model::{DropOperation, Point},
     drop_manager::{
-        build_drop_items, BaseDropEvent, DropEvent, DropSessionId, PlatformDropContextDelegate,
-        PlatformDropContextId,
+        build_drop_items, drop_event_reader, BaseDropEvent, DropEvent, DropSessionId,
+        PlatformDropContextDelegate, PlatformDropContextId,
     },
     error::{NativeExtensionsError, NativeExtensionsResult},
     log::OkLog,
@@ -72,7 +72,7 @@ struct Session {
     last_operation: Cell<DropOperation>,
     async_result: Rc<RefCell<Option<(IDataObjectAsyncCapability, DROPEFFECT)>>>,
     reader: Rc<PlatformDataReader>,
-    registered_reader: RegisteredDataReader,
+    registered_reader: OnceCell<RegisteredDataReader>,
 }
 
 impl PlatformDropContext {
@@ -218,8 +218,8 @@ impl PlatformDropContext {
         mask: DROPEFFECT,
         accepted_operation: Option<DropOperation>,
     ) -> NativeExtensionsResult<DropEvent> {
-        let local_data = self
-            .delegate()?
+        let delegate = self.delegate()?;
+        let local_data = delegate
             .get_platform_drag_contexts()
             .iter()
             .map(|c| c.get_local_data())
@@ -251,7 +251,14 @@ impl PlatformDropContext {
             allowed_operations: DropOperation::from_platform_mask(mask),
             accepted_operation,
             items,
-            reader: Some(session.registered_reader.clone()),
+            reader: drop_event_reader(&local_data, || {
+                session
+                    .registered_reader
+                    .get_or_init(|| {
+                        delegate.register_platform_reader(self.id, session.reader.clone())
+                    })
+                    .clone()
+            }),
         })
     }
 
@@ -300,8 +307,6 @@ impl PlatformDropContext {
                         data_object.clone(),
                         Some(drop_notifier),
                     );
-                    let registered_reader =
-                        delegate.register_platform_reader(self.id, reader.clone());
                     Rc::new(Session {
                         id: self.next_session_id.next_id().into(),
                         is_inside: Cell::new(true),
@@ -310,7 +315,7 @@ impl PlatformDropContext {
                         last_operation: Cell::new(DropOperation::None),
                         async_result,
                         reader,
-                        registered_reader,
+                        registered_reader: OnceCell::new(),
                     })
                 })
                 .clone();
