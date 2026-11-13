@@ -7,7 +7,6 @@ use std::{
 
 use irondash_engine_context::EngineContext;
 use irondash_message_channel::Late;
-use irondash_run_loop::{platform::PollSession, RunLoop};
 use log::warn;
 use windows::{
     core::{implement, ComInterface, PCWSTR},
@@ -47,6 +46,7 @@ use crate::{
 use super::{
     common::{create_instance, get_dpi_for_window},
     drag_common::DropOperationExt,
+    pump::pump_until,
     PlatformDataReader,
 };
 
@@ -420,12 +420,8 @@ impl PlatformDropContext {
                     }
                 }
             }
-            let mut poll_session = PollSession::new();
-            while !done.get() {
-                RunLoop::current()
-                    .platform_run_loop
-                    .poll_once(&mut poll_session);
-            }
+            pump_until(|| done.get());
+            // Also reached on WM_QUIT, where the drop is abandoned.
             self.drop_end()?;
         } else {
             *effect = DROPEFFECT_NONE;

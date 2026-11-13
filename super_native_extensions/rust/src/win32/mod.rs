@@ -10,6 +10,7 @@ mod image_conversion;
 mod keyboard_layout;
 mod menu;
 mod ole_initializer;
+mod pump;
 mod reader;
 mod virtual_file_stream;
 

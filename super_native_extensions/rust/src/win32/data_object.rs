@@ -9,7 +9,7 @@ use std::{
 };
 
 use irondash_message_channel::IsolateId;
-use irondash_run_loop::{platform::PollSession, RunLoop};
+use irondash_run_loop::RunLoop;
 use threadpool::ThreadPool;
 use windows::{
     core::{implement, HRESULT, HSTRING},
@@ -54,6 +54,7 @@ use super::{
         make_format_with_tymed_index, read_stream_fully,
     },
     image_conversion::convert_to_dib,
+    pump::pump_until,
     virtual_file_stream::{VirtualFileStream, VirtualStreamSession},
     PlatformDataProvider,
 };
@@ -123,17 +124,17 @@ impl DataObject {
         let delegate = provider.delegate.upgrade();
         if let Some(delegate) = delegate {
             let data = delegate.get_lazy_data(provider.isolate_id, id, None);
-            let mut poll_session = PollSession::new();
-            loop {
-                match data.try_take() {
-                    Some(ValuePromiseResult::Ok { value }) => {
-                        return value.coerce_to_data(StringFormat::Utf16NullTerminated)
-                    }
-                    Some(ValuePromiseResult::Cancelled) => return None,
-                    None => RunLoop::current()
-                        .platform_run_loop
-                        .poll_once(&mut poll_session),
+            let mut result = None;
+            pump_until(|| {
+                result = data.try_take();
+                result.is_some()
+            });
+            match result {
+                Some(ValuePromiseResult::Ok { value }) => {
+                    value.coerce_to_data(StringFormat::Utf16NullTerminated)
                 }
+                // None: WM_QUIT during shutdown.
+                Some(ValuePromiseResult::Cancelled) | None => None,
             }
         } else {
             None
