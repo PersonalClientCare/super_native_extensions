@@ -34,6 +34,7 @@ impl Context {
     ///
     /// Any NativeShell application must have exactly one context active.
     pub fn new() -> Self {
+        crate::panic_log::install();
         let internal = Rc::new(ContextInternal {
             attachments: RefCell::new(HashMap::new()),
             _initializer: Initializer::new(),

@@ -43,6 +43,7 @@ mod hot_key_manager;
 mod keyboard_layout_manager;
 mod log;
 mod menu_manager;
+mod panic_log;
 mod reader_manager;
 mod shadow;
 mod util;
