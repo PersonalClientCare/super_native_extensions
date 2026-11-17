@@ -31,7 +31,18 @@ const FLUTTER_WINDOWS_AFTER: Duration = Duration::from_millis(6);
 /// irondash. Checks `done` after every message. `done` is called repeatedly and
 /// may consume a value. Returns early when WM_QUIT is queued, leaving it for the
 /// outer loop.
-pub fn pump_until(mut done: impl FnMut() -> bool) {
+pub fn pump_until(done: impl FnMut() -> bool) {
+    pump(done, None);
+}
+
+/// Like `pump_until`, but gives up once `timeout` has elapsed. Returns whether `done`
+/// became true; a zero timeout checks `done` once and dispatches nothing.
+pub fn pump_until_timeout(done: impl FnMut() -> bool, timeout: Duration) -> bool {
+    pump(done, Some(timeout))
+}
+
+/// Returns whether `done` became true; false on WM_QUIT or when `limit` has elapsed.
+fn pump(mut done: impl FnMut() -> bool, limit: Option<Duration>) -> bool {
     // Creates this thread's irondash window, so it is found below.
     RunLoop::current();
     let start = Instant::now();
@@ -40,8 +51,18 @@ pub fn pump_until(mut done: impl FnMut() -> bool) {
     let mut next = 0;
     while !done() {
         if quit_queued() {
-            return;
+            return false;
         }
+        let wait_ms = match limit {
+            Some(limit) => {
+                let left = limit.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    return false;
+                }
+                left.as_millis().clamp(1, MAX_WAIT_MS as u128) as u32
+            }
+            None => MAX_WAIT_MS,
+        };
         if flutter_pending && start.elapsed() >= FLUTTER_WINDOWS_AFTER {
             windows.extend(thread_windows(FLUTTER_WINDOW_CLASS));
             flutter_pending = false;
@@ -51,13 +72,14 @@ pub fn pump_until(mut done: impl FnMut() -> bool) {
                 // Unpumped windows' queued messages would wake this wait at once and spin.
                 MsgWaitForMultipleObjectsEx(
                     None,
-                    MAX_WAIT_MS,
+                    wait_ms,
                     QS_POSTMESSAGE | QS_TIMER | QS_SENDMESSAGE,
                     MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS(0),
                 );
             }
         }
     }
+    true
 }
 
 fn thread_windows(class_name: &str) -> Vec<HWND> {
@@ -136,7 +158,8 @@ mod tests {
         },
     };
 
-    use super::{pump_until, FLUTTER_WINDOW_CLASS};
+    use super::{pump_until, pump_until_timeout, FLUTTER_WINDOW_CLASS};
+    use crate::platform_impl::platform::test_support::run_on_thread;
 
     const TARGET: usize = 100;
 
@@ -149,24 +172,12 @@ mod tests {
         sender.send(move || flood(next, stop, count));
     }
 
-    /// Runs `check` on a fresh thread and fails the test unless it reports true.
-    fn run_on_thread(check: impl FnOnce() -> bool + Send + 'static) {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(check());
-        });
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(true) => {}
-            Ok(false) => panic!("check failed on the test thread"),
-            Err(RecvTimeoutError::Timeout) => panic!("pump_until did not return"),
-            Err(RecvTimeoutError::Disconnected) => {
-                panic!("test thread panicked before reporting")
-            }
-        }
-    }
+    const RUN_LIMIT: Duration = Duration::from_secs(5);
 
-    /// Indexed by test window: 0 Flutter dispatch, 1 foreign, 2 spin, 3 Flutter under flood.
-    static WM_USER_COUNTS: [AtomicUsize; 4] = [
+    /// Indexed by test window: 0 Flutter dispatch, 1 foreign, 2 spin, 3 Flutter under
+    /// flood, 4 zero timeout.
+    static WM_USER_COUNTS: [AtomicUsize; 5] = [
+        AtomicUsize::new(0),
         AtomicUsize::new(0),
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -253,7 +264,7 @@ mod tests {
 
     #[test]
     fn dispatches_flutter_task_runner_windows() {
-        run_on_thread(|| unsafe {
+        run_on_thread(RUN_LIMIT, || unsafe {
             let _run_loop = RunLoop::current();
             let window = post_to_counting_window(FLUTTER_WINDOW_CLASS, 0);
             pump_until(|| WM_USER_COUNTS[0].load(Ordering::SeqCst) == 1);
@@ -265,7 +276,7 @@ mod tests {
 
     #[test]
     fn serves_flutter_windows_while_the_run_loop_window_floods() {
-        run_on_thread(|| unsafe {
+        run_on_thread(RUN_LIMIT, || unsafe {
             let run_loop = RunLoop::current();
             let stop = Arc::new(AtomicBool::new(false));
             flood(
@@ -284,7 +295,7 @@ mod tests {
 
     #[test]
     fn leaves_other_windows_alone() {
-        run_on_thread(|| unsafe {
+        run_on_thread(RUN_LIMIT, || unsafe {
             let run_loop = RunLoop::current();
             let foreign = post_to_counting_window("PumpTestForeignWindow", 1);
             let ran = Arc::new(AtomicBool::new(false));
@@ -303,7 +314,7 @@ mod tests {
 
     #[test]
     fn waits_without_spinning_while_other_windows_have_messages() {
-        run_on_thread(|| {
+        run_on_thread(RUN_LIMIT, || {
             let _run_loop = RunLoop::current();
             let window = post_to_counting_window("PumpTestSpinWindow", 2);
             let start = Instant::now();
@@ -318,8 +329,48 @@ mod tests {
     }
 
     #[test]
+    fn timeout_returns_false_once_the_deadline_passes() {
+        run_on_thread(RUN_LIMIT, || {
+            let _run_loop = RunLoop::current();
+            let start = Instant::now();
+            let done = pump_until_timeout(|| false, Duration::from_millis(300));
+            let elapsed = start.elapsed();
+            !done && elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(3)
+        });
+    }
+
+    #[test]
+    fn timeout_returns_true_immediately_when_already_done() {
+        run_on_thread(RUN_LIMIT, || {
+            let _run_loop = RunLoop::current();
+            let start = Instant::now();
+            let done = pump_until_timeout(|| true, Duration::from_millis(300));
+            done && start.elapsed() < Duration::from_millis(250)
+        });
+    }
+
+    #[test]
+    fn zero_timeout_checks_once_and_dispatches_nothing() {
+        run_on_thread(RUN_LIMIT, || unsafe {
+            let _run_loop = RunLoop::current();
+            let window = post_to_counting_window(FLUTTER_WINDOW_CLASS, 4);
+            let mut checks = 0usize;
+            let done = pump_until_timeout(
+                || {
+                    checks += 1;
+                    false
+                },
+                Duration::ZERO,
+            );
+            let dispatched = WM_USER_COUNTS[4].load(Ordering::SeqCst);
+            DestroyWindow(window).unwrap();
+            !done && checks == 1 && dispatched == 0
+        });
+    }
+
+    #[test]
     fn returns_on_quit() {
-        run_on_thread(|| unsafe {
+        run_on_thread(RUN_LIMIT, || unsafe {
             let _run_loop = RunLoop::current();
             PostQuitMessage(7);
             pump_until(|| false);
@@ -331,7 +382,7 @@ mod tests {
 
     #[test]
     fn returns_on_quit_posted_while_dispatching() {
-        run_on_thread(|| {
+        run_on_thread(RUN_LIMIT, || {
             let run_loop = RunLoop::current();
             let stop = Arc::new(AtomicBool::new(false));
             flood(

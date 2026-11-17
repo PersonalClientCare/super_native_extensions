@@ -40,6 +40,13 @@ impl VirtualSessionHandle {
     }
 }
 
+#[cfg(test)]
+impl VirtualSessionHandle {
+    pub(crate) fn new_for_test() -> Self {
+        Self(DropNotifier::new(|| {}))
+    }
+}
+
 /// Keeps the data provider alive
 #[allow(unused)] // DropNotifier is not read but needs to be retained.
 pub struct DataProviderHandle(DropNotifier);

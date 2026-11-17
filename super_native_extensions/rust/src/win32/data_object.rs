@@ -15,8 +15,8 @@ use windows::{
     core::{implement, HRESULT, HSTRING},
     Win32::{
         Foundation::{
-            GlobalFree, BOOL, DATA_S_SAMEFORMATETC, DV_E_FORMATETC, E_NOTIMPL, E_OUTOFMEMORY,
-            HGLOBAL, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK,
+            GlobalFree, BOOL, DATA_S_SAMEFORMATETC, DV_E_FORMATETC, E_INVALIDARG, E_NOTIMPL,
+            E_OUTOFMEMORY, HGLOBAL, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK,
         },
         System::{
             Com::{
@@ -44,7 +44,7 @@ use crate::{
     segmented_queue::{new_segmented_queue, QueueConfiguration},
     util::DropNotifier,
     value_coerce::{CoerceToData, StringFormat},
-    value_promise::{Promise, ValuePromiseResult},
+    value_promise::{Promise, ValuePromise, ValuePromiseResult},
 };
 
 use super::{
@@ -54,12 +54,15 @@ use super::{
         make_format_with_tymed_index, read_stream_fully,
     },
     image_conversion::convert_to_dib,
-    pump::pump_until,
+    pump::pump_until_timeout,
     virtual_file_stream::{VirtualFileStream, VirtualStreamSession},
     PlatformDataProvider,
 };
 
 const DATA_E_FORMATETC: HRESULT = HRESULT(-2147221404 + 1);
+
+// Another app's drag loop calls us; longer blocks make Windows flag our window as hung.
+const LAZY_DATA_WAIT: Duration = Duration::from_secs(2);
 
 struct ProviderEntry {
     provider: Rc<PlatformDataProvider>,
@@ -70,6 +73,9 @@ struct ProviderEntry {
 pub struct DataObject {
     providers: Vec<ProviderEntry>,
     extra_data: RefCell<HashMap<u16, Vec<u8>>>,
+    /// Promises of lazy values that timed out. A later request polls one of these once with no
+    /// wait and fails fast until the value has arrived; the delegate is not asked again.
+    lazy_pending: RefCell<HashMap<DataProviderValueId, Arc<ValuePromise>>>,
     in_operation: Cell<bool>, // async stream
     virtual_stream_notifiers: RefCell<Vec<Arc<DropNotifier>>>,
     thread_pool: RefCell<Option<ThreadPool>>,
@@ -94,6 +100,7 @@ impl DataObject {
                 })
                 .collect(),
             extra_data: RefCell::new(HashMap::new()),
+            lazy_pending: RefCell::new(HashMap::new()),
             in_operation: Cell::new(false),
             virtual_stream_notifiers: RefCell::new(Vec::new()),
             thread_pool: RefCell::new(None),
@@ -121,23 +128,37 @@ impl DataObject {
         provider: &PlatformDataProvider,
         id: DataProviderValueId,
     ) -> Option<Vec<u8>> {
+        // Held across the pump so the delegate outlives the wait.
         let delegate = provider.delegate.upgrade();
-        if let Some(delegate) = delegate {
-            let data = delegate.get_lazy_data(provider.isolate_id, id, None);
-            let mut result = None;
-            pump_until(|| {
-                result = data.try_take();
+        // The statement ends the borrow before pumping, which may reach GetData or SetData.
+        let pending = self.lazy_pending.borrow_mut().remove(&id);
+        let (promise, wait) = match (pending, &delegate) {
+            (Some(promise), _) => (promise, Duration::ZERO),
+            (None, Some(delegate)) => (
+                delegate.get_lazy_data(provider.isolate_id, id, None),
+                LAZY_DATA_WAIT,
+            ),
+            (None, None) => return None,
+        };
+        let mut result = None;
+        pump_until_timeout(
+            || {
+                result = promise.try_take();
                 result.is_some()
-            });
-            match result {
-                Some(ValuePromiseResult::Ok { value }) => {
-                    value.coerce_to_data(StringFormat::Utf16NullTerminated)
-                }
-                // None: WM_QUIT during shutdown.
-                Some(ValuePromiseResult::Cancelled) | None => None,
+            },
+            wait,
+        );
+        match result {
+            Some(ValuePromiseResult::Ok { value }) => {
+                value.coerce_to_data(StringFormat::Utf16NullTerminated)
             }
-        } else {
-            None
+            Some(ValuePromiseResult::Cancelled) => None,
+            // Not arrived yet, or WM_QUIT during shutdown: the next request polls
+            // it once, without waiting.
+            None => {
+                self.lazy_pending.borrow_mut().insert(id, promise);
+                None
+            }
         }
     }
 
@@ -495,11 +516,12 @@ impl IDataObject_Impl for DataObject {
 
         if format.cfFormat as u32 == format_file_contents {
             let stream = self
-                .stream_for_virtual_file_index(format.lindex as usize, Self::is_local_request());
+                .stream_for_virtual_file_index(format.lindex as usize, Self::is_local_request())
+                .ok_or_else(|| windows::core::Error::from(DV_E_FORMATETC))?;
             return Ok(STGMEDIUM {
                 tymed: TYMED_ISTREAM.0 as u32,
                 u: STGMEDIUM_0 {
-                    pstm: ManuallyDrop::new(stream),
+                    pstm: ManuallyDrop::new(Some(stream)),
                 },
                 pUnkForRelease: ManuallyDrop::new(None),
             });
@@ -507,24 +529,22 @@ impl IDataObject_Impl for DataObject {
 
         let needs_generate_bitmap = self.needs_synthesize_bitmap();
 
-        let data = self
-            .extra_data
-            .borrow()
-            .get(&format.cfFormat)
-            .cloned()
-            .or_else(|| {
-                if format.cfFormat as u32 == format_file_descriptor {
-                    self.data_for_file_group_descritor()
-                } else if format.cfFormat == CF_HDROP.0 {
-                    self.data_for_hdrop()
-                } else if needs_generate_bitmap && format.cfFormat == CF_DIB.0 {
-                    self.synthesize_bitmap_data(false).ok_log()
-                } else if needs_generate_bitmap && format.cfFormat == CF_DIBV5.0 {
-                    self.synthesize_bitmap_data(true).ok_log()
-                } else {
-                    self.data_for_format(format.cfFormat as u32, 0)
-                }
-            });
+        // Ends the borrow before the lazy path below, which pumps the run loop
+        // and may reach SetData.
+        let cached = self.extra_data.borrow().get(&format.cfFormat).cloned();
+        let data = cached.or_else(|| {
+            if format.cfFormat as u32 == format_file_descriptor {
+                self.data_for_file_group_descritor()
+            } else if format.cfFormat == CF_HDROP.0 {
+                self.data_for_hdrop()
+            } else if needs_generate_bitmap && format.cfFormat == CF_DIB.0 {
+                self.synthesize_bitmap_data(false).ok_log()
+            } else if needs_generate_bitmap && format.cfFormat == CF_DIBV5.0 {
+                self.synthesize_bitmap_data(true).ok_log()
+            } else {
+                self.data_for_format(format.cfFormat as u32, 0)
+            }
+        });
 
         // println!("DATA {:?} {:?}", data, format_to_string(format.cfFormat as u32));
 
@@ -618,6 +638,9 @@ impl IDataObject_Impl for DataObject {
                 let medium = &*pmedium;
                 let size = GlobalSize(medium.u.hGlobal);
                 let global_data = GlobalLock(medium.u.hGlobal);
+                if global_data.is_null() {
+                    return Err(E_INVALIDARG.into());
+                }
 
                 let v = slice::from_raw_parts(global_data as *const u8, size);
                 let global_data: Vec<u8> = v.into();
@@ -744,13 +767,16 @@ pub trait GetData {
             } else if medium.tymed == TYMED_HGLOBAL.0 as u32 {
                 let size = GlobalSize(medium.u.hGlobal);
                 let data = GlobalLock(medium.u.hGlobal);
+                if data.is_null() {
+                    Err(E_INVALIDARG.into())
+                } else {
+                    let v = slice::from_raw_parts(data as *const u8, size);
+                    let res: Vec<u8> = v.into();
 
-                let v = slice::from_raw_parts(data as *const u8, size);
-                let res: Vec<u8> = v.into();
+                    GlobalUnlock(medium.u.hGlobal).ok();
 
-                GlobalUnlock(medium.u.hGlobal).ok();
-
-                Ok(res)
+                    Ok(res)
+                }
             } else {
                 Err(DATA_E_FORMATETC.into())
             };
@@ -763,22 +789,27 @@ pub trait GetData {
         let format = make_format_with_tymed(format, TYMED(TYMED_ISTREAM.0 | TYMED_HGLOBAL.0));
         let res = unsafe {
             let mut medium = self.do_get_data(&format as *const _)?;
-            let res = if medium.tymed == TYMED_ISTREAM.0 as u32 {
-                medium.u.pstm.as_ref().cloned()
-            } else if medium.tymed == TYMED_HGLOBAL.0 as u32 {
-                let size = GlobalSize(medium.u.hGlobal);
-                let data = GlobalLock(medium.u.hGlobal);
-                let data = slice::from_raw_parts(data as *const u8, size);
-                let res = SHCreateMemStream(Some(data));
-                GlobalUnlock(medium.u.hGlobal).ok();
-                res
-            } else {
-                None
-            };
+            let res: windows::core::Result<Option<IStream>> =
+                if medium.tymed == TYMED_ISTREAM.0 as u32 {
+                    Ok(medium.u.pstm.as_ref().cloned())
+                } else if medium.tymed == TYMED_HGLOBAL.0 as u32 {
+                    let size = GlobalSize(medium.u.hGlobal);
+                    let data = GlobalLock(medium.u.hGlobal);
+                    if data.is_null() {
+                        Err(E_INVALIDARG.into())
+                    } else {
+                        let data = slice::from_raw_parts(data as *const u8, size);
+                        let res = SHCreateMemStream(Some(data));
+                        GlobalUnlock(medium.u.hGlobal).ok();
+                        Ok(res)
+                    }
+                } else {
+                    Ok(None)
+                };
             ReleaseStgMedium(&mut medium as *mut STGMEDIUM);
             res
         };
-        res.ok_or_else(|| DATA_E_FORMATETC.into())
+        res?.ok_or_else(|| DATA_E_FORMATETC.into())
     }
 
     fn has_data_for_format(&self, format: &FORMATETC) -> bool {
@@ -871,5 +902,319 @@ where
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+    use irondash_message_channel::{IsolateId, Value};
+    use irondash_run_loop::RunLoop;
+    use windows::{
+        core::HSTRING,
+        Win32::{
+            Foundation::S_OK,
+            System::{
+                DataExchange::RegisterClipboardFormatW,
+                Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GLOBAL_ALLOC_FLAGS},
+                Ole::CF_UNICODETEXT,
+            },
+        },
+    };
+
+    use super::*;
+    use crate::{
+        api_model::{DataProvider, DataProviderValueId, DataRepresentation},
+        data_provider_manager::{VirtualFileResult, VirtualSessionHandle},
+        platform_impl::platform::test_support::run_on_thread,
+        util::DropNotifier,
+        value_promise::{ValuePromise, ValuePromiseSetCancel},
+    };
+
+    /// The limit leaves room for the two-second lazy wait in the timeout tests.
+    const RUN_LIMIT: Duration = Duration::from_secs(10);
+
+    fn hglobal_with(bytes: &[u8]) -> windows::core::Result<HGLOBAL> {
+        unsafe {
+            let global = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0), bytes.len())?;
+            let dest = GlobalLock(global);
+            assert!(!dest.is_null());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest as *mut u8, bytes.len());
+            GlobalUnlock(global).ok();
+            Ok(global)
+        }
+    }
+
+    /// Stores `bytes` under `format` through IDataObject::SetData, as a client would.
+    fn set_data(data_object: &IDataObject, format: u32, bytes: &[u8]) -> windows::core::Result<()> {
+        let format = make_format_with_tymed(format, TYMED_HGLOBAL);
+        let medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 {
+                hGlobal: hglobal_with(bytes)?,
+            },
+            pUnkForRelease: ManuallyDrop::new(None),
+        };
+        // frelease = TRUE: SetData takes ownership of the HGLOBAL.
+        unsafe { data_object.SetData(&format, &medium, true) }
+    }
+
+    #[derive(Default)]
+    struct Probe {
+        set_data_succeeded: Cell<bool>,
+    }
+
+    /// Lazy provider whose data is delivered from a run-loop task that first calls
+    /// SetData on the same DataObject and only then fulfils the promise.
+    struct ReentrantDelegate {
+        data_object: RefCell<Option<IDataObject>>,
+        probe: Rc<Probe>,
+        other_format: u32,
+        other_bytes: Vec<u8>,
+    }
+
+    #[async_trait(?Send)]
+    impl PlatformDataProviderDelegate for ReentrantDelegate {
+        fn get_lazy_data(
+            &self,
+            _isolate_id: IsolateId,
+            _data_id: DataProviderValueId,
+            _on_done: Option<Box<dyn FnOnce()>>,
+        ) -> Arc<ValuePromise> {
+            let promise = Arc::new(ValuePromise::new());
+            let promise_clone = promise.clone();
+            let data_object = self.data_object.borrow().clone().expect("data object");
+            let probe = self.probe.clone();
+            let other_format = self.other_format;
+            let other_bytes = self.other_bytes.clone();
+            RunLoop::current()
+                .schedule_next(move || {
+                    // A borrow still held by the pending GetData makes this panic inside
+                    // the COM method, which aborts the test binary.
+                    let result = set_data(&data_object, other_format, &other_bytes);
+                    probe.set_data_succeeded.set(result.is_ok());
+                    promise_clone.set_value(Value::String("lazy".to_owned()));
+                })
+                .detach();
+            promise
+        }
+
+        async fn get_lazy_data_async(
+            &self,
+            _isolate_id: IsolateId,
+            _data_id: DataProviderValueId,
+        ) -> ValuePromiseResult {
+            unimplemented!()
+        }
+
+        fn get_virtual_file(
+            &self,
+            _isolate_id: IsolateId,
+            _virtual_file_id: DataProviderValueId,
+            _stream_handle: i32,
+            _on_size_known: Box<dyn Fn(Option<i64>)>,
+            _on_progress: Box<dyn Fn(f64)>,
+            _on_done: Box<dyn FnOnce(VirtualFileResult)>,
+        ) -> Arc<VirtualSessionHandle> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn get_data_survives_set_data_from_the_pump() {
+        run_on_thread(RUN_LIMIT, || {
+            let _ole = super::super::OleInitializer::new();
+            RunLoop::current();
+
+            let probe = Rc::new(Probe::default());
+            let other_format =
+                unsafe { RegisterClipboardFormatW(&HSTRING::from("PccTestSetDuringPump")) };
+            let other_bytes: Vec<u8> = vec![1, 2, 3, 4];
+            let delegate = Rc::new(ReentrantDelegate {
+                data_object: RefCell::new(None),
+                probe: probe.clone(),
+                other_format,
+                other_bytes: other_bytes.clone(),
+            });
+            let delegate_dyn: Rc<dyn PlatformDataProviderDelegate> = delegate.clone();
+            let data_object = lazy_text_data_object(&delegate_dyn);
+            *delegate.data_object.borrow_mut() = Some(data_object.clone());
+
+            let lazy_text = data_object
+                .get_data(CF_UNICODETEXT.0 as u32)
+                .expect("lazy text");
+
+            assert!(
+                probe.set_data_succeeded.get(),
+                "SetData did not run or failed while GetData was pending"
+            );
+            let expected_text = utf16_nul("lazy");
+            // GlobalSize may round the allocation up, so compare the prefix.
+            assert!(lazy_text.starts_with(&expected_text), "{lazy_text:?}");
+
+            let stored = data_object
+                .get_data(other_format)
+                .expect("stored by SetData");
+            assert!(stored.starts_with(&other_bytes), "{stored:?}");
+            assert!(data_object.has_data(other_format));
+            let format = make_format_with_tymed(other_format, TYMED_HGLOBAL);
+            let query = unsafe { data_object.QueryGetData(&format) };
+            assert_eq!(query, S_OK);
+            true
+        });
+    }
+
+    /// Lazy provider that hands out a promise, keeps a clone and never fulfils it on
+    /// its own. Counts `get_lazy_data` calls.
+    #[derive(Default)]
+    struct PendingDelegate {
+        promise: RefCell<Option<Arc<ValuePromise>>>,
+        calls: Cell<usize>,
+    }
+
+    #[async_trait(?Send)]
+    impl PlatformDataProviderDelegate for PendingDelegate {
+        fn get_lazy_data(
+            &self,
+            _isolate_id: IsolateId,
+            _data_id: DataProviderValueId,
+            _on_done: Option<Box<dyn FnOnce()>>,
+        ) -> Arc<ValuePromise> {
+            self.calls.set(self.calls.get() + 1);
+            let promise = Arc::new(ValuePromise::new());
+            *self.promise.borrow_mut() = Some(promise.clone());
+            promise
+        }
+
+        async fn get_lazy_data_async(
+            &self,
+            _isolate_id: IsolateId,
+            _data_id: DataProviderValueId,
+        ) -> ValuePromiseResult {
+            unimplemented!()
+        }
+
+        fn get_virtual_file(
+            &self,
+            _isolate_id: IsolateId,
+            _virtual_file_id: DataProviderValueId,
+            _stream_handle: i32,
+            _on_size_known: Box<dyn Fn(Option<i64>)>,
+            _on_progress: Box<dyn Fn(f64)>,
+            _on_done: Box<dyn FnOnce(VirtualFileResult)>,
+        ) -> Arc<VirtualSessionHandle> {
+            unimplemented!()
+        }
+    }
+
+    /// Expected CF_UNICODETEXT bytes for `text`: UTF-16LE with a terminating NUL.
+    fn utf16_nul(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(|u| u.to_le_bytes())
+            .collect()
+    }
+
+    /// DataObject with one lazy CF_UNICODETEXT value served by `delegate`. The caller
+    /// keeps `delegate` alive, because the provider holds only a Weak reference to it.
+    fn lazy_text_data_object(delegate: &Rc<dyn PlatformDataProviderDelegate>) -> IDataObject {
+        let provider = Rc::new(PlatformDataProvider::new(
+            Rc::downgrade(delegate),
+            IsolateId(1),
+            DataProvider {
+                representations: vec![DataRepresentation::Lazy {
+                    id: DataProviderValueId::try_from(Value::I64(1)).unwrap(),
+                    format: format_to_string(CF_UNICODETEXT.0 as u32),
+                }],
+                suggested_name: None,
+            },
+        ));
+        let handle = Arc::new(DataProviderHandle::from(DropNotifier::new(|| {})));
+        DataObject::create(vec![(provider, handle)])
+    }
+
+    #[test]
+    fn slow_lazy_value_times_out_once_then_fails_fast() {
+        run_on_thread(RUN_LIMIT, || {
+            let _ole = super::super::OleInitializer::new();
+            RunLoop::current();
+
+            let delegate = Rc::new(PendingDelegate::default());
+            let delegate_dyn: Rc<dyn PlatformDataProviderDelegate> = delegate.clone();
+            let data_object = lazy_text_data_object(&delegate_dyn);
+
+            let start = Instant::now();
+            let first = data_object.get_data(CF_UNICODETEXT.0 as u32);
+            let first_took = start.elapsed();
+            assert!(
+                first.is_err(),
+                "first request got data before the wait ended"
+            );
+            // Windows flags a window as hung after about 5 s, so stay well below that.
+            assert!(
+                first_took >= Duration::from_millis(1500) && first_took < Duration::from_secs(4),
+                "first request took {first_took:?}"
+            );
+
+            let start = Instant::now();
+            let second = data_object.get_data(CF_UNICODETEXT.0 as u32);
+            let second_took = start.elapsed();
+            assert!(second.is_err());
+            assert!(
+                second_took < Duration::from_millis(500),
+                "second request took {second_took:?}"
+            );
+            assert_eq!(delegate.calls.get(), 1);
+            true
+        });
+    }
+
+    #[test]
+    fn late_lazy_value_is_delivered_on_the_next_request() {
+        run_on_thread(RUN_LIMIT, || {
+            let _ole = super::super::OleInitializer::new();
+            RunLoop::current();
+
+            let delegate = Rc::new(PendingDelegate::default());
+            let delegate_dyn: Rc<dyn PlatformDataProviderDelegate> = delegate.clone();
+            let data_object = lazy_text_data_object(&delegate_dyn);
+
+            assert!(data_object.get_data(CF_UNICODETEXT.0 as u32).is_err());
+            let promise = delegate
+                .promise
+                .borrow()
+                .clone()
+                .expect("get_lazy_data was not called");
+            promise.set_value(Value::String("late".to_owned()));
+
+            let late = data_object
+                .get_data(CF_UNICODETEXT.0 as u32)
+                .expect("late lazy text");
+            let expected_text = utf16_nul("late");
+            // GlobalSize may round the allocation up, so compare the prefix.
+            assert!(late.starts_with(&expected_text), "{late:?}");
+            assert_eq!(delegate.calls.get(), 1);
+            true
+        });
+    }
+
+    #[test]
+    fn get_file_contents_without_virtual_file_at_index_is_dv_e_formatetc() {
+        RunLoop::current();
+        let data_object = DataObject::create(Vec::new());
+        let file_contents = unsafe { RegisterClipboardFormatW(CFSTR_FILECONTENTS) };
+        let format = make_format_with_tymed_index(file_contents, TYMED_ISTREAM, 5);
+        let err = match unsafe { data_object.GetData(&format) } {
+            Ok(_) => panic!("GetData returned a stream for a missing virtual file"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), DV_E_FORMATETC);
     }
 }

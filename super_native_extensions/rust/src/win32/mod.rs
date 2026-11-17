@@ -12,6 +12,8 @@ mod menu;
 mod ole_initializer;
 mod pump;
 mod reader;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod virtual_file_stream;
 
 pub use clipboard_events::*;

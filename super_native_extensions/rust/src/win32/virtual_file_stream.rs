@@ -9,7 +9,7 @@ use threadpool::ThreadPool;
 use windows::{
     core::{implement, ComInterface},
     Win32::{
-        Foundation::{E_FAIL, E_NOTIMPL, S_FALSE, S_OK},
+        Foundation::{E_FAIL, E_NOTIMPL, STG_E_INVALIDPOINTER, S_FALSE, S_OK},
         System::Com::{
             CoInitialize, CoUninitialize, ISequentialStream_Impl, IStream, IStream_Impl,
             Marshal::CoMarshalInterThreadInterfaceInStream,
@@ -73,6 +73,16 @@ impl Stream {
         cb: u32,
         pcbread: *mut u32,
     ) -> windows::core::HRESULT {
+        if pv.is_null() && cb > 0 {
+            return STG_E_INVALIDPOINTER;
+        }
+        // An empty read must not reach read_some, which would report a finished segment.
+        if cb == 0 {
+            if !pcbread.is_null() {
+                unsafe { *pcbread = 0 };
+            }
+            return S_OK;
+        }
         self.initialize_if_needed();
         let inner = self.inner.lock().unwrap();
         match inner.stream.as_ref() {
@@ -80,11 +90,12 @@ impl Stream {
                 // This doesn't entirely conform to ISequentialStream::Read documentation.
                 // To avoid blocking we may read less data than requested and still
                 // return S_OK.
-                let pcbread = unsafe { &mut *pcbread };
                 let data = stream.reader.read_some(cb as usize);
                 let data_out = unsafe { slice::from_raw_parts_mut(pv as *mut u8, data.len()) };
                 data_out.copy_from_slice(&data);
-                *pcbread = data.len() as u32;
+                if !pcbread.is_null() {
+                    unsafe { *pcbread = data.len() as u32 };
+                }
 
                 stream
                     .position
@@ -367,5 +378,102 @@ impl IStream_Impl for VirtualFileStream {
 
     fn Clone(&self) -> windows::core::Result<IStream> {
         Err(E_NOTIMPL.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::Cell,
+        sync::{Arc, Mutex},
+    };
+
+    use irondash_run_loop::RunLoop;
+    use windows::{
+        core::HRESULT,
+        Win32::Foundation::{STG_E_INVALIDPOINTER, S_OK},
+    };
+
+    use super::{Stream, StreamInner, StreamState};
+    use crate::{
+        data_provider_manager::VirtualSessionHandle,
+        segmented_queue::{new_segmented_queue, QueueConfiguration},
+        value_promise::Promise,
+    };
+
+    /// Stream whose queue already holds `bytes` and is completed, so `read` never blocks.
+    fn stream_with_bytes(bytes: &[u8]) -> Stream {
+        let (writer, reader) = new_segmented_queue(QueueConfiguration {
+            memory_segment_max_size: 1024,
+            file_segment_max_length: 0,
+            max_memory_usage: None,
+        });
+        writer.write(bytes);
+        writer.close();
+        Stream {
+            inner: Mutex::new(StreamInner {
+                stream: Some(StreamState {
+                    reader,
+                    size_promise: Arc::new(Promise::new()),
+                    error_promise: Arc::new(Promise::new()),
+                    _handle: Arc::new(VirtualSessionHandle::new_for_test()),
+                    position: Cell::new(0),
+                }),
+                factory: None,
+                run_loop_sender: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn read_accepts_null_pcbread() {
+        RunLoop::current();
+        let stream = stream_with_bytes(b"hello");
+        let mut buf = [0u8; 4];
+        let hr: HRESULT = stream.read(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            buf.len() as u32,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(hr, S_OK);
+        assert_eq!(&buf, b"hell");
+    }
+
+    #[test]
+    fn read_rejects_null_buffer_without_consuming_queue() {
+        RunLoop::current();
+        let stream = stream_with_bytes(b"hello");
+        let mut count = 0u32;
+        let hr = stream.read(std::ptr::null_mut(), 4, &mut count);
+        assert_eq!(hr, STG_E_INVALIDPOINTER);
+
+        let mut buf = [0u8; 5];
+        let hr = stream.read(buf.as_mut_ptr() as *mut core::ffi::c_void, 5, &mut count);
+        assert_eq!(hr, S_OK);
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn zero_length_read_does_not_consume_queue() {
+        RunLoop::current();
+        let stream = stream_with_bytes(b"hello");
+        let mut buf = [0u8; 5];
+        let mut count = 7u32;
+        let hr = stream.read(buf.as_mut_ptr() as *mut core::ffi::c_void, 0, &mut count);
+        assert_eq!(hr, S_OK);
+        assert_eq!(count, 0);
+
+        let hr = stream.read(buf.as_mut_ptr() as *mut core::ffi::c_void, 5, &mut count);
+        assert_eq!(hr, S_OK);
+        assert_eq!(count, 5);
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn zero_length_read_accepts_null_buffer_and_null_pcbread() {
+        RunLoop::current();
+        let stream = stream_with_bytes(b"hello");
+        let hr = stream.read(std::ptr::null_mut(), 0, std::ptr::null_mut());
+        assert_eq!(hr, S_OK);
     }
 }

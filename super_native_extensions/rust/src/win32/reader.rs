@@ -490,6 +490,11 @@ impl PlatformDataReader {
                 let stream = unsafe {
                     let size = GlobalSize(medium.u.hGlobal);
                     let data = GlobalLock(medium.u.hGlobal);
+                    if data.is_null() {
+                        return Err(NativeExtensionsError::VirtualFileReceiveError(
+                            "Could not lock HGlobal".into(),
+                        ));
+                    }
                     let data = slice::from_raw_parts(data as *const u8, size);
                     let res = SHCreateMemStream(Some(data));
                     GlobalUnlock(medium.u.hGlobal).ok();
@@ -550,12 +555,16 @@ impl PlatformDataReader {
                 let res = unsafe {
                     let size = GlobalSize(medium.u.hGlobal);
                     let data = GlobalLock(medium.u.hGlobal);
-                    let data = slice::from_raw_parts(data as *const u8, size);
-                    let res = fs::write(&path, data);
-                    GlobalUnlock(medium.u.hGlobal).ok();
-                    progress.report_progress(Some(1.0));
-                    res
+                    if data.is_null() {
+                        Err(std::io::Error::other("Could not lock HGlobal"))
+                    } else {
+                        let data = slice::from_raw_parts(data as *const u8, size);
+                        let res = fs::write(&path, data);
+                        GlobalUnlock(medium.u.hGlobal).ok();
+                        res
+                    }
                 };
+                progress.report_progress(Some(1.0));
                 match res {
                     Ok(_) => completer.complete(Ok(path)),
                     Err(err) => completer.complete(Err(
