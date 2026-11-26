@@ -84,14 +84,15 @@ class BaseDraggableWidget extends StatelessWidget {
               child: child!,
             );
           } else {
-            return DummyDragDetector(
-              child: DesktopDragDetector(
-                hitTestBehavior: hitTestBehavior,
-                dragConfiguration: dragConfiguration,
-                isLocationDraggable: isLocationDraggable,
-                mouseDragDelay: mouseDragDelay,
-                child: child!,
-              ),
+            // No DummyDragDetector here: its delayed recognizer accepts a
+            // pointer held still for the long-press timeout, so a mouse held
+            // that long before moving would never start the drag.
+            return DesktopDragDetector(
+              hitTestBehavior: hitTestBehavior,
+              dragConfiguration: dragConfiguration,
+              isLocationDraggable: isLocationDraggable,
+              mouseDragDelay: mouseDragDelay,
+              child: child!,
             );
           }
         },

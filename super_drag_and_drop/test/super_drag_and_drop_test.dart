@@ -2,6 +2,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:super_drag_and_drop/src/drag_internal.dart';
+import 'package:super_drag_and_drop/super_drag_and_drop.dart';
 
 const _delay = Duration(milliseconds: 300);
 
@@ -138,6 +139,28 @@ void main() {
     expect(dragStarts, 0);
     await gesture.up();
   });
+
+  // A DummyDragDetector accepts a pointer held still for the long-press
+  // timeout and starts nothing, so with a mouse held that long before moving
+  // the desktop drag lost the arena and never started.
+  testWidgets("a mouse draggable has no recognizer that claims a held pointer",
+      (tester) async {
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: Offset.zero);
+    await mouse.moveTo(const Offset(1, 1));
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: DraggableWidget(
+          dragItemsProvider: (_) => [],
+          child: const SizedBox.expand(),
+        ),
+      ),
+    );
+    expect(find.byType(DesktopDragDetector), findsOneWidget);
+    expect(find.byType(DummyDragDetector), findsNothing);
+    await mouse.removePointer();
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 }
 
 class _NoopDrag extends Drag {}
